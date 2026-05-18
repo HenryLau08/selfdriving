@@ -1,0 +1,6 @@
+/data
+/extracted_data
+/frames
+/runs
+yolo*
+!yolo_comparison.py
