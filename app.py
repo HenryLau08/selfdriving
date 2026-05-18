@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 import streamlit as st
 
+# Run in terminal:
+# streamlit run app.py
 
 # =========================================================
 # CONFIG
@@ -12,7 +14,7 @@ import streamlit as st
 
 st.set_page_config(layout="wide")
 
-folder_path = "extracted_data/right"
+folder_path = "extracted_data/right" # Folder path of the images
 n_images = 10
 seed = 42
 
