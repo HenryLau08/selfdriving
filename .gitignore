@@ -1,6 +1,8 @@
 /data
 /TT100K_dataset
 /extracted_data
+/Roboflow_data
+/coco
 /frames
 /runs
 yolo*
