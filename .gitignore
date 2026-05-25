@@ -1,9 +1,11 @@
-/data
+/*data*
 /TT100K_dataset
 /extracted_data
 /Roboflow_data
-/coco
+/*coco*
 /frames
 /runs
-yolo*
-!yolo_comparison.py
+/sdc_2025
+/*best.pt
+latest.mp4
+yolo*.pt
