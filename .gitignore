@@ -1,7 +1,7 @@
 /*data*
 /TT100K_dataset
 /extracted_data
-/Roboflow_data
+/roboflow*
 /*coco*
 /frames
 /runs
@@ -9,3 +9,4 @@
 /*best.pt
 latest.mp4
 yolo*.pt
+yolo*.mp4
