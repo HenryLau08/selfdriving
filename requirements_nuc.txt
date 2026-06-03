@@ -1,0 +1,8 @@
+# NUC detection pipeline requirements
+ultralytics>=8.3.0
+easyocr>=1.7.0
+opencv-python>=4.9.0
+numpy>=1.24.0
+openvino>=2025.1.0
+# Note: install NPU drivers separately from Intel's driver page
+# https://docs.openvino.ai/2025/get-started/install-openvino/configurations.html
