@@ -25,6 +25,7 @@ import threading
 import time
 from collections import deque
 from typing import Optional
+import cv2
 
 import numpy as np
 
@@ -125,36 +126,29 @@ class LidarReader:
         self._running  = False
         self._thread   = None
         self._lidar    = None
+        self._latest_scan = []
         self.connected = False
         self.scan_count = 0
 
-    def start(self) -> bool:
-        """Start the background reader thread. Returns True if LIDAR connected."""
-        if not RPLIDAR_AVAILABLE:
-            print("  ⚠  rplidar library not available.")
-            return False
+    def _connect(self) -> bool:
+        """Attempt to connect to the RPLidar and query its health."""
+        self._close_lidar()
         try:
             self._lidar = RPLidar(self.port, baudrate=self.baudrate)
             info = self._lidar.get_info()
             health = self._lidar.get_health()
             print(f"  RPLidar connected: {info}")
             print(f"  Health: {health}")
-            self._running  = True
             self.connected = True
-            self._thread   = threading.Thread(target=self._read_loop,
-                                               daemon=True, name="LidarReader")
-            self._thread.start()
             return True
         except Exception as e:
             print(f"  ⚠  Could not connect to RPLidar on {self.port}: {e}")
             self.connected = False
+            self._lidar = None
             return False
 
-    def stop(self):
-        """Stop the reader thread and close the LIDAR."""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=3.0)
+    def _close_lidar(self):
+        """Close and disconnect the current LIDAR instance."""
         if self._lidar:
             try:
                 self._lidar.stop()
@@ -162,29 +156,70 @@ class LidarReader:
                 self._lidar.disconnect()
             except Exception:
                 pass
+        self._lidar = None
+        self.connected = False
+
+    def start(self) -> bool:
+        """Start the background reader thread. Returns True if LIDAR connected."""
+        if not RPLIDAR_AVAILABLE:
+            print("  ⚠  rplidar library not available.")
+            return False
+        if not self._connect():
+            return False
+        self._running  = True
+        self._thread   = threading.Thread(target=self._read_loop,
+                                           daemon=True, name="LidarReader")
+        self._thread.start()
+        return True
+
+    def stop(self):
+        """Stop the reader thread and close the LIDAR."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=3.0)
+        self._close_lidar()
         print("  LIDAR stopped.")
+
+    def restart(self) -> bool:
+        """Restart the lidar reader and reconnect if needed."""
+        self.stop()
+        return self.start()
 
     def _read_loop(self):
         """Background thread: continuously read scans from RPLidar."""
-        try:
-            for scan in self._lidar.iter_scans(max_buf_meas=500):
-                if not self._running:
-                    break
-                points = []
-                for (_, angle, dist_mm) in scan:
-                    dist_m = dist_mm / 1000.0
-                    if DIST_MIN_M <= dist_m <= DIST_MAX_M:
-                        points.append((float(angle), dist_m))
-                if points:
-                    with self._lock:
-                        self._scans.append(points)
-                        self.scan_count += 1
-        except RPLidarException as e:
-            if self._running:
-                print(f"  LIDAR read error: {e}")
-        except Exception as e:
-            if self._running:
-                print(f"  LIDAR unexpected error: {e}")
+        while self._running:
+            if self._lidar is None and not self._connect():
+                time.sleep(1.0)
+                continue
+
+            try:
+                for scan in self._lidar.iter_scans(max_buf_meas=100):
+                    if not self._running:
+                        break
+                    points = []
+                    for (_, angle, dist_mm) in scan:
+                        dist_m = dist_mm / 1000.0
+                        if DIST_MIN_M <= dist_m <= DIST_MAX_M:
+                            points.append((float(angle), dist_m))
+                    if points:
+                        with self._lock:
+                            self._scans.append(points)
+                            self._latest_scan = points
+                            self.scan_count += 1
+                if self._running:
+                    print("  LIDAR scan iterator ended unexpectedly; reconnecting...")
+                    self._close_lidar()
+                    time.sleep(1.0)
+            except RPLidarException as e:
+                if self._running:
+                    print(f"  LIDAR read error: {e}; reconnecting...")
+                    self._close_lidar()
+                    time.sleep(1.0)
+            except Exception as e:
+                if self._running:
+                    print(f"  LIDAR unexpected error: {e}; reconnecting...")
+                    self._close_lidar()
+                    time.sleep(1.0)
 
     def get_distance_in_sector(self, a_min: float, a_max: float) -> Optional[float]:
         """
@@ -195,11 +230,13 @@ class LidarReader:
         with self._lock:
             if not self._scans:
                 return None
+
             distances = []
             for scan in self._scans:
                 for (angle, dist_m) in scan:
                     if angles_in_range(angle, a_min, a_max):
                         distances.append(dist_m)
+
         return min(distances) if distances else None
 
     def get_forward_distance(self, sector_deg: float = 20.0) -> Optional[float]:
@@ -215,9 +252,9 @@ class LidarReader:
     def get_full_scan(self) -> list:
         """Return a copy of the latest scan for visualisation."""
         with self._lock:
-            if not self._scans:
+            if not self._latest_scan:
                 return []
-            return list(self._scans[-1])
+            return list(self._latest_scan)
 
 
 # ── Distance annotation ───────────────────────────────────────────────────────
@@ -257,6 +294,16 @@ def annotate_distance(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
 
+def cv2_gui_available() -> bool:
+    """Check whether OpenCV GUI functions are available (Qt/GTK backend)."""
+    try:
+        cv2.namedWindow("opencv_gui_test", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("opencv_gui_test")
+        return True
+    except cv2.error:
+        return False
+
+
 # ── LIDAR visualisation window ────────────────────────────────────────────────
 
 class LidarVisualiser:
@@ -269,11 +316,23 @@ class LidarVisualiser:
 
     def __init__(self):
         import cv2
-        cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.WIN, self.SIZE, self.SIZE)
-        self._blank()
+        self._enabled = False
+        if not cv2_gui_available():
+            print("  ⚠  OpenCV GUI backend unavailable. LIDAR visualisation disabled.")
+            return
+
+        try:
+            cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.WIN, self.SIZE, self.SIZE)
+            self._enabled = True
+            self._blank()
+        except cv2.error as e:
+            print(f"  ⚠  Could not create LIDAR visualiser window: {e}")
+            self._enabled = False
 
     def _blank(self):
+        if not self._enabled:
+            return
         import cv2
         canvas = np.zeros((self.SIZE, self.SIZE, 3), dtype=np.uint8)
         cx, cy = self.SIZE // 2, self.SIZE // 2
@@ -281,7 +340,15 @@ class LidarVisualiser:
         cv2.circle(canvas, (cx, cy), (cx - 4) // 2, (30, 30, 30), 1)
         cv2.imshow(self.WIN, canvas)
 
-    def update(self, scan: list, img_width: int = IMAGE_WIDTH_PX):
+    def update(self, scan: list, img_width: int = IMAGE_WIDTH_PX,
+               forward_deg: float | None = None, width_deg: float | None = None):
+        """
+        Update the polar plot. If `forward_deg` and `width_deg` are provided,
+        only points inside that forward sector are drawn (useful for front-only
+        visualisation when the lidar is mounted on a vehicle).
+        """
+        if not self._enabled:
+            return
         import cv2
         canvas = np.zeros((self.SIZE, self.SIZE, 3), dtype=np.uint8)
         cx, cy = self.SIZE // 2, self.SIZE // 2
@@ -294,18 +361,34 @@ class LidarVisualiser:
             cv2.putText(canvas, f"{r_m}m", (cx + r_px + 2, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
 
-        # Draw camera FOV wedge
-        fov_half = CAMERA_HFOV_DEG / 2
-        a1 = math.radians(LIDAR_FORWARD_DEG - fov_half - 90)
-        a2 = math.radians(LIDAR_FORWARD_DEG + fov_half - 90)
-        pts = [(cx, cy)]
-        for a in np.linspace(a1, a2, 30):
-            r = self.SIZE // 2 - 5
-            pts.append((int(cx + r * math.cos(a)), int(cy + r * math.sin(a))))
-        cv2.fillPoly(canvas, [np.array(pts, dtype=np.int32)], (0, 20, 40))
+        # Optional forward sector (highlight and filtering)
+        sector_active = (forward_deg is not None and width_deg is not None)
+        if sector_active:
+            half = width_deg / 2.0
+            s_min = (forward_deg - half) % 360
+            s_max = (forward_deg + half) % 360
+            # Handle wrap-around (e.g., s_min=350, s_max=10) by ensuring the
+            # angular sweep is monotonic. Compute start/end in degrees relative
+            # to the -90° offset used for drawing, and if the end is less than
+            # the start add 360° so linspace creates an increasing sequence.
+            a_start_deg = s_min - 90
+            a_end_deg   = s_max - 90
+            if a_end_deg < a_start_deg:
+                a_end_deg += 360.0
+            a_start = math.radians(a_start_deg)
+            a_end   = math.radians(a_end_deg)
+            pts2 = [(cx, cy)]
+            for a in np.linspace(a_start, a_end, 120):
+                r = self.SIZE // 2 - 5
+                pts2.append((int(cx + r * math.cos(a)), int(cy + r * math.sin(a))))
+            cv2.fillPoly(canvas, [np.array(pts2, dtype=np.int32)], (10, 40, 80))
 
-        # Draw LIDAR points
+        # Draw LIDAR points. If a forward sector is active, only draw points
+        # inside that sector (otherwise draw all points).
         for (angle, dist_m) in scan:
+            if sector_active:
+                if not angles_in_range(angle, s_min, s_max):
+                    continue
             rad = math.radians(angle - 90)
             px  = int(cx + dist_m * scale * math.cos(rad))
             py  = int(cy + dist_m * scale * math.sin(rad))
@@ -316,7 +399,8 @@ class LidarVisualiser:
         cv2.arrowedLine(canvas, (cx, cy),
                         (cx, cy - 30), (0, 255, 180), 1, tipLength=0.3)
 
-        cv2.imshow(self.WIN, canvas)
+        if self._enabled:
+            cv2.imshow(self.WIN, canvas)
 
 
 # ── Standalone test ───────────────────────────────────────────────────────────

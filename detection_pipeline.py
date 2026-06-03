@@ -35,6 +35,7 @@ from lidar_pipeline import (
     bbox_angle_range, annotate_distance,
     distance_color_bgr, distance_label,
     DIST_DANGER, DIST_WARNING, IMAGE_WIDTH_PX,
+    LIDAR_FORWARD_DEG,
 )
 
 import video as video
@@ -43,7 +44,7 @@ can = importlib.import_module("can")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL_PATH     = "best_openvino_model"   # or "best.pt" for CPU fallback
+MODEL_PATH     = "best.pt"   # or "best.pt" for CPU fallback
 CONFIDENCE     = 0.35
 PADDING        = 12
 OCR_EVERY_N    = 3          # run OCR every N frames (OCR is slow on CPU)
@@ -79,6 +80,34 @@ COLORS = {
 }
 
 
+# ── OpenCV GUI availability check ────────────────────────────────────────────
+
+def cv2_gui_available() -> bool:
+    """Check whether OpenCV GUI functions are available (GTK/Qt/Cocoa backend)."""
+    try:
+        cv2.namedWindow("opencv_gui_test", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("opencv_gui_test")
+        return True
+    except cv2.error:
+        return False
+
+
+def create_lidar_settings_window(initial_forward: int,
+                                 initial_width: int) -> str:
+    win_name = "LIDAR Settings"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 420, 80)
+    cv2.createTrackbar("Forward", win_name, initial_forward, 360, lambda x: None)
+    cv2.createTrackbar("Width", win_name, initial_width, 180, lambda x: None)
+    return win_name
+
+
+def get_lidar_settings(win_name: str) -> tuple[int, int]:
+    forward = cv2.getTrackbarPos("Forward", win_name) % 360
+    width   = cv2.getTrackbarPos("Width", win_name)
+    return forward, max(10, width)
+
+
 # ── Camera — same init as lane_follow ─────────────────────────────────────────
 
 def initialize_camera() -> cv2.VideoCapture:
@@ -90,9 +119,9 @@ def initialize_camera() -> cv2.VideoCapture:
         raise SystemExit(1)
 
     front = config.get("front")
-    if not front:
-        print("Front camera not configured!", file=sys.stderr)
-        raise SystemExit(1)
+    # if not front:
+    #     print("Front camera not configured!", file=sys.stderr)
+    #     raise SystemExit(1)
 
     cap = cv2.VideoCapture(front)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  848)
@@ -112,7 +141,7 @@ def initialize_camera() -> cv2.VideoCapture:
 # ── CAN ───────────────────────────────────────────────────────────────────────
 
 def initialize_can() -> Any:
-    return can.Bus(interface="socketcan", channel="can0", bitrate=500000)
+    return can.Bus(interface="socketcan", channel="vcan0", bitrate=500000)
 
 
 def _make_detection_message() -> Any:
@@ -240,7 +269,7 @@ def draw_stats(frame, fps: float, device: str, speed_kmh, class_counter: Counter
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(device: str, use_can: bool) -> None:
+def run(device: str, use_can: bool, lidar_enabled: bool, lidar_port: str) -> None:
     print("Loading YOLO model …")
     model = YOLO(MODEL_PATH)
     print(f"  device : {device}")
@@ -253,9 +282,9 @@ def run(device: str, use_can: bool) -> None:
     # ── LIDAR init ────────────────────────────────────────────────────────
     lidar     = None
     lidar_vis = None
-    if LIDAR_ENABLED:
+    if lidar_enabled:
         print("Starting LIDAR …")
-        lidar = LidarReader(port=LIDAR_PORT)
+        lidar = LidarReader(port=lidar_port)
         if lidar.start():
             print("  LIDAR ready.")
             if LIDAR_SHOW_VIS:
@@ -278,22 +307,42 @@ def run(device: str, use_can: bool) -> None:
     camera = initialize_camera()
     print("Camera opened.")
 
-    # Windows
-    cv2.namedWindow("Object Detection", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Speed Sign OCR",   cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Speed Sign OCR",  320, 320)
+    # Check OpenCV GUI availability
+    gui_available = cv2_gui_available()
+    if not gui_available:
+        print("  ⚠  OpenCV GUI backend unavailable. Running without visualisation.")
 
-    fps_times     = deque(maxlen=60)
-    class_counter = Counter()
-    frame_idx     = 0
-    last_speed    = None
-    last_ocr_raw  = ""
-    last_crop     = None
+    # Windows (only create if GUI is available)
+    settings_window = None
+    lidar_forward_deg = int(LIDAR_FORWARD_DEG) % 360
+    lidar_front_width = 140
+    if gui_available:
+        cv2.namedWindow("Object Detection", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Speed Sign OCR",   cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Speed Sign OCR",  320, 320)
+        cv2.namedWindow("Traffic Light", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Traffic Light", 320, 320)
+        settings_window = create_lidar_settings_window(lidar_forward_deg,
+                                                       lidar_front_width)
 
-    blank = np.zeros((320, 320, 3), dtype=np.uint8)
-    cv2.putText(blank, "No speed sign yet", (10, 160),
+    fps_times      = deque(maxlen=60)
+    class_counter  = Counter()
+    frame_idx      = 0
+    last_speed     = None
+    last_ocr_raw   = ""
+    last_crop      = None
+    last_tl_crop   = None
+    last_tl_state  = "off"
+
+    ocr_blank = np.zeros((320, 320, 3), dtype=np.uint8)
+    cv2.putText(ocr_blank, "No speed sign yet", (10, 160),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
-    cv2.imshow("Speed Sign OCR", blank)
+    tl_blank = np.zeros((320, 320, 3), dtype=np.uint8)
+    cv2.putText(tl_blank, "No traffic light yet", (10, 160),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+    if gui_available:
+        cv2.imshow("Speed Sign OCR", ocr_blank)
+        cv2.imshow("Traffic Light", tl_blank)
 
     print("\nRunning — press Q to quit.\n")
 
@@ -303,6 +352,9 @@ def run(device: str, use_can: bool) -> None:
             if not ret:
                 print("Failed to read frame.")
                 break
+
+            if gui_available and settings_window is not None:
+                lidar_forward_deg, lidar_front_width = get_lidar_settings(settings_window)
 
             frame_rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w         = frame_rgb.shape[:2]
@@ -322,7 +374,8 @@ def run(device: str, use_can: bool) -> None:
                 # ── LIDAR distance for this bounding box ─────────────────
                 dist_m = None
                 if lidar is not None:
-                    a_min, a_max = bbox_angle_range(x1, x2, w)
+                    a_min, a_max = bbox_angle_range(x1, x2, w,
+                                                    forward_deg=lidar_forward_deg)
                     dist_m = lidar.get_distance_in_sector(a_min, a_max)
                     if dist_m is not None:
                         all_distances.append(dist_m)
@@ -347,11 +400,16 @@ def run(device: str, use_can: bool) -> None:
                         lbl = f"{last_speed} km/h" if last_speed else f"'{last_ocr_raw}'"
                         cv2.putText(ocr_disp, lbl, (8, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 180), 2)
-                        cv2.imshow("Speed Sign OCR", ocr_disp)
+                        if gui_available:
+                            cv2.imshow("Speed Sign OCR", ocr_disp)
 
                     speed = last_speed
                     if speed:
                         frame_speed = speed
+
+                if cls_id == TRAFFIC_LIGHT_ID:
+                    last_tl_crop = frame_rgb[y1:y2, x1:x2]
+                    last_tl_state = detect_traffic_light_color(last_tl_crop)
 
                 detections.append({
                     "label":      label,
@@ -374,7 +432,10 @@ def run(device: str, use_can: bool) -> None:
 
             # ── LIDAR CAN update ─────────────────────────────────────────────
             if use_can and lidar_task is not None:
-                fwd_dist   = lidar.get_forward_distance() if lidar else None
+                half = lidar_front_width / 2.0
+                a_min = (lidar_forward_deg - half) % 360
+                a_max = (lidar_forward_deg + half) % 360
+                fwd_dist   = lidar.get_distance_in_sector(a_min, a_max) if lidar else None
                 min_dist   = min(all_distances) if all_distances else None
                 _update_lidar_message(lidar_task, lidar_message, fwd_dist, min_dist)
 
@@ -392,14 +453,29 @@ def run(device: str, use_can: bool) -> None:
             draw_stats(display, fps, device.upper(),
                        frame_speed or last_speed, class_counter)
 
-            cv2.imshow("Object Detection", display)
+            if gui_available:
+                cv2.putText(display,
+                            f"LIDAR forward={lidar_forward_deg}° width={lidar_front_width}°",
+                            (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (220, 220, 220), 1)
+                cv2.imshow("Object Detection", display)
+
+                if last_tl_crop is not None:
+                    tl_disp = draw_traffic_light_overlay(last_tl_crop, last_tl_state)
+                else:
+                    tl_disp = np.zeros((320, 320, 3), dtype=np.uint8)
+                    cv2.putText(tl_disp, "No traffic light yet", (10, 160),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+                cv2.imshow("Traffic Light", tl_disp)
 
             # Update LIDAR polar plot
             if lidar_vis is not None:
-                lidar_vis.update(lidar.get_full_scan(), img_width=w)
+                lidar_vis.update(lidar.get_full_scan(), img_width=w,
+                                 forward_deg=lidar_forward_deg,
+                                 width_deg=lidar_front_width)
 
             frame_idx += 1
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            if gui_available and cv2.waitKey(1) & 0xFF == ord("q"):
                 print("Quit.")
                 break
 
@@ -415,25 +491,41 @@ def run(device: str, use_can: bool) -> None:
             time.sleep(0.1)
             det_task.stop()
         camera.release()
-        cv2.destroyAllWindows()
+        if gui_available:
+            cv2.destroyAllWindows()
         print("Done.")
 
 
+# def main() -> None:
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--device",  default="intel:npu",
+#                         help="Inference device (default: intel:npu)")
+#     parser.add_argument("--no-can",   action="store_true",
+#                         help="Disable CAN bus (display only)")
+#     parser.add_argument("--no-lidar", action="store_true",
+#                         help="Disable LIDAR")
+#     parser.add_argument("--lidar-port", default=LIDAR_PORT,
+#                         help=f"LIDAR serial port (default: {LIDAR_PORT})")
+#     args = parser.parse_args()
+#     LIDAR_ENABLED = not args.no_lidar
+#     LIDAR_PORT    = args.lidar_port
+#     run(device=args.device, use_can=not args.no_can)
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device",  default="intel:npu",
-                        help="Inference device (default: intel:npu)")
-    parser.add_argument("--no-can",   action="store_true",
-                        help="Disable CAN bus (display only)")
-    parser.add_argument("--no-lidar", action="store_true",
-                        help="Disable LIDAR")
-    parser.add_argument("--lidar-port", default=LIDAR_PORT,
-                        help=f"LIDAR serial port (default: {LIDAR_PORT})")
-    args = parser.parse_args()
-    LIDAR_ENABLED = not args.no_lidar
-    LIDAR_PORT    = args.lidar_port
-    run(device=args.device, use_can=not args.no_can)
+    parser.add_argument("--device", default="intel:npu")
+    parser.add_argument("--no-can", action="store_true")
+    parser.add_argument("--no-lidar", action="store_true")
+    parser.add_argument("--lidar-port", default=LIDAR_PORT)
 
+    args = parser.parse_args()
+
+    run(
+        device=args.device,
+        use_can=not args.no_can,
+        lidar_enabled=not args.no_lidar,
+        lidar_port=args.lidar_port,
+    )
 
 if __name__ == "__main__":
     main()
