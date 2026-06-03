@@ -30,6 +30,12 @@ import numpy as np
 import easyocr
 from ultralytics import YOLO
 from traffic_light_color import detect_traffic_light_color, draw_traffic_light_overlay
+from lidar_pipeline import (
+    LidarReader, LidarVisualiser,
+    bbox_angle_range, annotate_distance,
+    distance_color_bgr, distance_label,
+    DIST_DANGER, DIST_WARNING, IMAGE_WIDTH_PX,
+)
 
 import video as video
 
@@ -52,7 +58,13 @@ TRAFFIC_LIGHT_ID   = SCHEMA.index("traffic_light")
 
 # CAN
 CAN_MESSAGE_SENDING_SPEED = 0.04
-DETECTION_ID              = 0x440   # new message ID for detections
+DETECTION_ID              = 0x440   # detections (class bitfield + speed)
+LIDAR_ID                  = 0x450   # LIDAR distances per detection
+
+# LIDAR
+LIDAR_PORT      = "/dev/ttyUSB0"   # adjust if needed
+LIDAR_ENABLED   = True            # set False to run without LIDAR
+LIDAR_SHOW_VIS  = True            # show polar scan window
 
 # BGR colours per class
 COLORS = {
@@ -131,7 +143,46 @@ def _build_class_bitfield(detections: list) -> int:
     return bits
 
 
-# ── OCR helpers ───────────────────────────────────────────────────────────────
+# ── LIDAR CAN helpers ────────────────────────────────────────────────────────
+
+def _make_lidar_message() -> Any:
+    return can.Message(
+        arbitration_id=LIDAR_ID,
+        data=[0xFF] * 8,   # 0xFF = no reading
+        is_extended_id=False,
+    )
+
+
+def _update_lidar_message(task: Any, message: Any,
+                           forward_dist_m: float | None,
+                           min_dist_m: float | None) -> None:
+    """
+    byte 0-1 : forward distance in cm (uint16, 0xFFFF = no reading)
+    byte 2-3 : minimum distance across all detections in cm
+    byte 4   : obstacle status  0=clear 1=warning 2=danger
+    bytes 5-7: reserved
+    """
+    def to_cm(v): return min(0xFFFE, int(v * 100)) if v is not None else 0xFFFF
+    fwd_cm = to_cm(forward_dist_m)
+    min_cm = to_cm(min_dist_m)
+    if min_dist_m is None:
+        status = 0
+    elif min_dist_m < DIST_DANGER:
+        status = 2
+    elif min_dist_m < DIST_WARNING:
+        status = 1
+    else:
+        status = 0
+    message.data = [
+        (fwd_cm >> 8) & 0xFF, fwd_cm & 0xFF,
+        (min_cm >> 8) & 0xFF, min_cm & 0xFF,
+        status,
+        0, 0, 0,
+    ]
+    task.modify_data(message)
+
+
+# ── OCR helpers ─────────────────────────────────────────────────────────────────
 
 def extract_speed(text: str):
     nums  = re.findall(r'\b(\d{2,3})\b', text)
@@ -152,17 +203,10 @@ def preprocess_crop(crop_rgb: np.ndarray) -> np.ndarray:
 
 # ── Drawing ───────────────────────────────────────────────────────────────────
 
-def draw_box(frame, label, conf, speed, x1, y1, x2, y2, tl_color=None):
+def draw_box(frame, label, conf, speed, x1, y1, x2, y2):
     color = COLORS.get(label, (200, 200, 200))
-    if label == "traffic_light" and tl_color:
-        color = {"red": (0, 0, 230), "green": (0, 200, 0), "off": (120, 120, 120)}.get(tl_color, color)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    if label == "speed_sign" and speed:
-        text = f"{speed} km/h"
-    elif label == "traffic_light" and tl_color:
-        text = f"light: {tl_color}"
-    else:
-        text = f"{label} {conf:.2f}"
+    text = f"{speed} km/h" if (label == "speed_sign" and speed) else f"{label} {conf:.2f}"
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
     cv2.rectangle(frame, (x1, max(y1 - th - 8, 0)),
                   (x1 + tw + 4, max(y1, th + 8)), color, -1)
@@ -206,12 +250,30 @@ def run(device: str, use_can: bool) -> None:
     reader = easyocr.Reader(["en"], gpu=False)
     print("  OCR ready.")
 
+    # ── LIDAR init ────────────────────────────────────────────────────────
+    lidar     = None
+    lidar_vis = None
+    if LIDAR_ENABLED:
+        print("Starting LIDAR …")
+        lidar = LidarReader(port=LIDAR_PORT)
+        if lidar.start():
+            print("  LIDAR ready.")
+            if LIDAR_SHOW_VIS:
+                lidar_vis = LidarVisualiser()
+        else:
+            print("  LIDAR not available — continuing without it.")
+            lidar = None
+
     bus = det_task = det_message = None
+    lidar_task = lidar_message = None
     if use_can:
         bus         = initialize_can()
         det_message = _make_detection_message()
         det_task    = bus.send_periodic(det_message, CAN_MESSAGE_SENDING_SPEED)
         print("CAN bus ready — broadcasting on ID 0x440.")
+        lidar_message = _make_lidar_message()
+        lidar_task    = bus.send_periodic(lidar_message, CAN_MESSAGE_SENDING_SPEED)
+        print("LIDAR CAN ready — broadcasting on ID 0x450.")
 
     camera = initialize_camera()
     print("Camera opened.")
@@ -220,8 +282,6 @@ def run(device: str, use_can: bool) -> None:
     cv2.namedWindow("Object Detection", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Speed Sign OCR",   cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Speed Sign OCR",  320, 320)
-    cv2.namedWindow("Traffic Light",      cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Traffic Light",     160, 160)
 
     fps_times     = deque(maxlen=60)
     class_counter = Counter()
@@ -229,17 +289,11 @@ def run(device: str, use_can: bool) -> None:
     last_speed    = None
     last_ocr_raw  = ""
     last_crop     = None
-    last_tl_color = "off"
 
     blank = np.zeros((320, 320, 3), dtype=np.uint8)
     cv2.putText(blank, "No speed sign yet", (10, 160),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
     cv2.imshow("Speed Sign OCR", blank)
-
-    tl_blank = np.zeros((160, 160, 3), dtype=np.uint8)
-    cv2.putText(tl_blank, "No light yet", (6, 85),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-    cv2.imshow("Traffic Light", tl_blank)
 
     print("\nRunning — press Q to quit.\n")
 
@@ -257,12 +311,21 @@ def run(device: str, use_can: bool) -> None:
 
             detections   = []
             frame_speed  = None
+            all_distances = []   # distances for all detections this frame
 
             for box in yolo_results.boxes:
                 cls_id = int(box.cls[0])
                 conf   = float(box.conf[0])
                 label  = model.names[cls_id]
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                # ── LIDAR distance for this bounding box ─────────────────
+                dist_m = None
+                if lidar is not None:
+                    a_min, a_max = bbox_angle_range(x1, x2, w)
+                    dist_m = lidar.get_distance_in_sector(a_min, a_max)
+                    if dist_m is not None:
+                        all_distances.append(dist_m)
 
                 speed = None
                 if cls_id == SPEED_SIGN_ID:
@@ -290,24 +353,13 @@ def run(device: str, use_can: bool) -> None:
                     if speed:
                         frame_speed = speed
 
-                # ── Traffic light color detection ────────────────────────────────
-                tl_color = None
-                if cls_id == TRAFFIC_LIGHT_ID:
-                    x1p = max(0, x1 - PADDING);  x2p = min(w, x2 + PADDING)
-                    y1p = max(0, y1 - PADDING);  y2p = min(h, y2 + PADDING)
-                    tl_crop       = frame_rgb[y1p:y2p, x1p:x2p]
-                    last_tl_color = detect_traffic_light_color(tl_crop)
-                    tl_color      = last_tl_color
-                    tl_disp = draw_traffic_light_overlay(tl_crop, last_tl_color)
-                    cv2.imshow("Traffic Light", tl_disp)
-                    print(f"[{frame_idx}] traffic_light → {last_tl_color}")
-
                 detections.append({
-                    "label": label, "class_id": cls_id,
+                    "label":      label,
+                    "class_id":   cls_id,
                     "confidence": round(conf, 3),
-                    "bbox": (x1, y1, x2, y2),
-                    "speed_kmh": speed,
-                    "tl_color":  tl_color,
+                    "bbox":       (x1, y1, x2, y2),
+                    "speed_kmh":  speed,
+                    "dist_m":     dist_m,
                 })
                 class_counter[label] += 1
 
@@ -320,13 +372,19 @@ def run(device: str, use_can: bool) -> None:
                     class_bitfield=_build_class_bitfield(detections),
                 )
 
+            # ── LIDAR CAN update ─────────────────────────────────────────────
+            if use_can and lidar_task is not None:
+                fwd_dist   = lidar.get_forward_distance() if lidar else None
+                min_dist   = min(all_distances) if all_distances else None
+                _update_lidar_message(lidar_task, lidar_message, fwd_dist, min_dist)
+
             # ── Draw & display ───────────────────────────────────────────────
             display = frame.copy()
             for d in detections:
                 x1, y1, x2, y2 = d["bbox"]
                 draw_box(display, d["label"], d["confidence"],
-                         d["speed_kmh"], x1, y1, x2, y2,
-                         tl_color=d.get("tl_color"))
+                         d["speed_kmh"], x1, y1, x2, y2)
+                annotate_distance(display, x1, y1, x2, y2, d.get("dist_m"))
 
             fps_times.append(time.perf_counter())
             fps = (len(fps_times) - 1) / (
@@ -335,6 +393,10 @@ def run(device: str, use_can: bool) -> None:
                        frame_speed or last_speed, class_counter)
 
             cv2.imshow("Object Detection", display)
+
+            # Update LIDAR polar plot
+            if lidar_vis is not None:
+                lidar_vis.update(lidar.get_full_scan(), img_width=w)
 
             frame_idx += 1
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -346,6 +408,8 @@ def run(device: str, use_can: bool) -> None:
 
     finally:
         print("Shutting down …")
+        if lidar:
+            lidar.stop()
         if det_task:
             _update_detection_message(det_task, det_message, 0, 0, 0)
             time.sleep(0.1)
@@ -359,9 +423,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device",  default="intel:npu",
                         help="Inference device (default: intel:npu)")
-    parser.add_argument("--no-can", action="store_true",
+    parser.add_argument("--no-can",   action="store_true",
                         help="Disable CAN bus (display only)")
+    parser.add_argument("--no-lidar", action="store_true",
+                        help="Disable LIDAR")
+    parser.add_argument("--lidar-port", default=LIDAR_PORT,
+                        help=f"LIDAR serial port (default: {LIDAR_PORT})")
     args = parser.parse_args()
+    LIDAR_ENABLED = not args.no_lidar
+    LIDAR_PORT    = args.lidar_port
     run(device=args.device, use_can=not args.no_can)
 
 
